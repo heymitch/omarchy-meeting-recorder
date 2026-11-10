@@ -12,10 +12,12 @@ mod diarize;
 mod export;
 mod find;
 mod ipc;
+mod live;
 mod meeting;
 mod models;
 mod nemotron;
 mod player;
+mod remote;
 mod settings;
 mod notes;
 mod theme;
@@ -156,6 +158,7 @@ fn main() -> glib::ExitCode {
             transcribe::cli_file(&std::env::args().skip(2).collect::<Vec<_>>())
         }
         Some("diarize") => diarize::cli(&std::env::args().skip(2).collect::<Vec<_>>()),
+        Some("transcribe-live") => live::cli(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some("transcribe") => transcribe::cli(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some("action") => actions::cli(&std::env::args().skip(2).collect::<Vec<_>>()),
         // A new window in the running app, or the app itself when it is not running.

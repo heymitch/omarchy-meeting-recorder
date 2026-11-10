@@ -891,6 +891,7 @@ dependencies = [
  "serde_json",
  "ureq",
  "whisper-rs",
+ "whisper-words",
 ]
 
 [[package]]
@@ -1621,6 +1622,13 @@ dependencies = [
  "cmake",
  "fs_extra",
  "semver",
+]
+
+[[package]]
+name = "whisper-words"
+version = "0.1.0"
+dependencies = [
+ "whisper-rs",
 ]
 
 [[package]]

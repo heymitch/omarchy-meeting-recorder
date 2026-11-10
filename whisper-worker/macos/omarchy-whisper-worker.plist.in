@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The worker as a launchd agent: up at login, back after a crash, and
+     retried every ten seconds while the address is not there yet (Tailscale
+     still starting). install.sh fills in HOME and LISTEN. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.omarchy.whisper-worker</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@HOME@/.local/bin/omarchy-whisper-worker</string>
+    <string>--model</string>
+    <string>@HOME@/.local/share/omarchy-meeting-recorder/models/ggml-large-v3-turbo.bin</string>
+    <string>--listen</string>
+    <string>@LISTEN@</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>StandardErrorPath</key>
+  <string>@HOME@/Library/Logs/omarchy-whisper-worker.log</string>
+  <key>StandardOutPath</key>
+  <string>@HOME@/Library/Logs/omarchy-whisper-worker.log</string>
+</dict>
+</plist>

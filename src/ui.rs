@@ -430,6 +430,8 @@ struct Recorder {
     model_downloading: Cell<bool>,
     drop_hint: gtk::Label,
     staging: RefCell<Option<PathBuf>>,
+    /// The live transcription of the recording under way, when a worker is set.
+    live: RefCell<Option<crate::live::Handle>>,
     result_dir: RefCell<Option<PathBuf>>,
     abort: RefCell<Option<Abort>>,
     quit_when_done: Cell<bool>,
@@ -1008,6 +1010,7 @@ impl Recorder {
             model_downloading: Cell::new(false),
             drop_hint,
             staging: RefCell::default(),
+            live: RefCell::default(),
             result_dir: RefCell::default(),
             abort: RefCell::default(),
             quit_when_done: Cell::new(false),
@@ -1484,7 +1487,7 @@ impl Recorder {
             let this = r.clone();
             glib::spawn_future_local(async move {
                 let result = this
-                    .run_transcription(tracks, this.selected_language())
+                    .run_transcription(tracks, this.selected_language(), None)
                     .await;
                 this.hold_animation(&result).await;
                 this.finished(true, result);
@@ -2206,8 +2209,12 @@ impl Recorder {
                         m.duration_secs = duration;
                         let _ = meeting::write(&out, m);
                     }
-                    this.run_transcription(Tracks::Single(source_track(&out), speakers), language)
-                        .await
+                    this.run_transcription(
+                        Tracks::Single(source_track(&out), speakers),
+                        language,
+                        None,
+                    )
+                    .await
                 }
                 Err(message) => Err(message),
             };
@@ -2477,6 +2484,7 @@ impl Recorder {
             return;
         }
         self.webcam.audio_started();
+        *self.live.borrow_mut() = crate::live::spawn(&staging, self.selected_language());
         write_recording_note(
             &staging,
             &self.title(),
@@ -2507,6 +2515,7 @@ impl Recorder {
         self.mic.stop_recording();
         self.system.stop_recording();
         let webcam = self.webcam.end();
+        let live = self.live.borrow_mut().take();
         let Some(staging) = self.staging.borrow().clone() else {
             return;
         };
@@ -2528,6 +2537,8 @@ impl Recorder {
         let this = self.clone();
         glib::spawn_future_local(async move {
             let (audio_out, audio_staging) = (out.clone(), staging.clone());
+            // The last live pass finishes while the audio is saved.
+            let prior = gio::spawn_blocking(move || live.map(crate::live::Handle::finish));
             let saved = gio::spawn_blocking(move || {
                 let _ = std::fs::create_dir_all(&audio_out);
                 let (mic, system) = (
@@ -2565,8 +2576,9 @@ impl Recorder {
             *this.manifest.borrow_mut() = Some(manifest);
             *this.result_dir.borrow_mut() = Some(out);
 
+            let prior = prior.await.ok().flatten();
             let result = this
-                .run_transcription(Tracks::Raw(staging.clone()), language)
+                .run_transcription(Tracks::Raw(staging.clone()), language, prior)
                 .await;
             // The kept tracks are enough to transcribe again; the raw files can go.
             if saved == (true, true) {
@@ -2582,6 +2594,7 @@ impl Recorder {
         &self,
         tracks: Tracks,
         language: &'static str,
+        prior: Option<crate::live::Prior>,
     ) -> Result<(), String> {
         let Some(out) = self.result_dir.borrow().clone() else {
             return Err("no meeting folder".into());
@@ -2601,6 +2614,13 @@ impl Recorder {
         let (events_tx, events_rx) = async_channel::unbounded::<Event>();
         let (done_tx, done_rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
+            // Behind everything else on the machine: the speaker model, and
+            // whisper when it runs here, would otherwise slow the desktop down.
+            // Threads they start inherit it.
+            // SAFETY: setpriority only changes this thread's own nice value.
+            unsafe {
+                libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+            }
             let result = match tracks {
                 Tracks::Single(path, speakers) => transcribe::load_track(&path).and_then(|track| {
                     transcribe::transcribe_single(&track, language, speakers, &events_tx, &abort)
@@ -2613,7 +2633,14 @@ impl Recorder {
                     };
                     transcribe::load_track(&mic_path).and_then(|mic| {
                         let computer = transcribe::load_track(&computer_path)?;
-                        transcribe::transcribe(&mic, &computer, language, &events_tx, &abort)
+                        transcribe::transcribe(
+                            &mic,
+                            &computer,
+                            language,
+                            prior.as_ref(),
+                            &events_tx,
+                            &abort,
+                        )
                     })
                 }
             };

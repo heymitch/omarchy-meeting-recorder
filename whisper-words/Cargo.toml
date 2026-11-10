@@ -1,0 +1,9 @@
+[package]
+name = "whisper-words"
+version = "0.1.0"
+edition = "2024"
+description = "The whisper settings and word timing shared by the recorder and its remote worker"
+license = "MIT"
+
+[dependencies]
+whisper-rs = "0.16"

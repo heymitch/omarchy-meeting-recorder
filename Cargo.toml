@@ -14,6 +14,7 @@ realfft = "3"
 ring = "0.17"
 ureq = "3.4.2"
 whisper-rs = "0.16"
+whisper-words = { path = "whisper-words" }
 
 [features]
 default = ["vulkan"]

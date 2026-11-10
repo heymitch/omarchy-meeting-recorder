@@ -16,12 +16,12 @@ use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use gtk::glib;
-use whisper_rs::{
-    DtwMode, DtwParameters, FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters,
-};
+use whisper_rs::WhisperContext;
+pub use whisper_words::Word;
 
 use crate::APP_NAME;
 use crate::audio::{CHANNELS, RATE};
+use crate::remote::Remote;
 
 pub const WHISPER_RATE: usize = 16_000;
 
@@ -210,30 +210,16 @@ fn decode_with_ffmpeg(path: &Path) -> Result<Vec<f32>, String> {
 }
 
 /// Decimates by an integer `factor` behind a windowed-sinc low-pass filter.
+#[cfg(test)]
+pub(crate) fn downsample_for_test(input: &[f32], factor: usize) -> Vec<f32> {
+    downsample(input, factor)
+}
+
 fn downsample(input: &[f32], factor: usize) -> Vec<f32> {
     if factor <= 1 {
         return input.to_vec();
     }
-    const TAPS: usize = 63;
-    // Cut off a little below the new Nyquist frequency.
-    let cutoff = 0.9 / (2.0 * factor as f64);
-    let mid = (TAPS / 2) as f64;
-    let mut kernel: Vec<f32> = (0..TAPS)
-        .map(|i| {
-            let x = i as f64 - mid;
-            let sinc = if x == 0.0 {
-                2.0 * cutoff
-            } else {
-                (2.0 * std::f64::consts::PI * cutoff * x).sin() / (std::f64::consts::PI * x)
-            };
-            let t = 2.0 * std::f64::consts::PI * i as f64 / (TAPS - 1) as f64;
-            let blackman = 0.42 - 0.5 * t.cos() + 0.08 * (2.0 * t).cos();
-            (sinc * blackman) as f32
-        })
-        .collect();
-    let sum: f32 = kernel.iter().sum();
-    kernel.iter_mut().for_each(|k| *k /= sum);
-
+    let kernel = downsample_kernel(factor);
     let half = TAPS / 2;
     (0..input.len() / factor)
         .map(|n| {
@@ -254,7 +240,32 @@ fn downsample(input: &[f32], factor: usize) -> Vec<f32> {
         .collect()
 }
 
-fn rms(samples: &[f32]) -> f32 {
+pub(crate) const TAPS: usize = 63;
+
+/// The low-pass filter `downsample` uses, also for audio that keeps coming.
+pub(crate) fn downsample_kernel(factor: usize) -> Vec<f32> {
+    // Cut off a little below the new Nyquist frequency.
+    let cutoff = 0.9 / (2.0 * factor as f64);
+    let mid = (TAPS / 2) as f64;
+    let mut kernel: Vec<f32> = (0..TAPS)
+        .map(|i| {
+            let x = i as f64 - mid;
+            let sinc = if x == 0.0 {
+                2.0 * cutoff
+            } else {
+                (2.0 * std::f64::consts::PI * cutoff * x).sin() / (std::f64::consts::PI * x)
+            };
+            let t = 2.0 * std::f64::consts::PI * i as f64 / (TAPS - 1) as f64;
+            let blackman = 0.42 - 0.5 * t.cos() + 0.08 * (2.0 * t).cos();
+            (sinc * blackman) as f32
+        })
+        .collect();
+    let sum: f32 = kernel.iter().sum();
+    kernel.iter_mut().for_each(|k| *k /= sum);
+    kernel
+}
+
+pub(crate) fn rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;
     }
@@ -274,19 +285,39 @@ fn is_silent(samples: &[f32]) -> bool {
     samples.iter().fold(0.0f32, |m, s| m.max(s.abs())) < 0.003
 }
 
+/// The level of every 30 ms frame of `track`.
+pub(crate) fn frame_levels(track: &[f32]) -> Vec<f32> {
+    track.chunks(FRAME).map(rms).collect()
+}
+
 /// How loud a track is while something is said: the 95th percentile of its
 /// 30 ms frame levels, so pauses do not drag it down.
-fn active_level(samples: &[f32]) -> f32 {
-    let mut levels: Vec<f32> = samples.chunks(WHISPER_RATE * 30 / 1000).map(rms).collect();
+fn active_level(levels: &[f32]) -> f32 {
     if levels.is_empty() {
         return 0.0;
     }
+    let mut levels = levels.to_vec();
     levels.sort_by(f32::total_cmp);
     levels[levels.len() * 95 / 100]
 }
 
+/// What `mix` multiplies a track by, from its frame levels and its peak.
+pub(crate) fn level_gain(levels: &[f32], peak: f32) -> f32 {
+    const TARGET: f32 = 0.1;
+    let level = active_level(levels);
+    if peak < 0.003 || level < 0.003 {
+        1.0
+    } else {
+        (TARGET / level).clamp(0.25, 8.0)
+    }
+}
+
+fn peak(samples: &[f32]) -> f32 {
+    samples.iter().fold(0.0f32, |m, s| m.max(s.abs()))
+}
+
 /// Leaves everything below 0.8 alone and bends what is above it towards 1.0.
-fn soft_clip(x: f32) -> f32 {
+pub(crate) fn soft_clip(x: f32) -> f32 {
     const KNEE: f32 = 0.8;
     if x.abs() <= KNEE {
         x
@@ -299,15 +330,7 @@ fn soft_clip(x: f32) -> f32 {
 /// level first, so a quiet mic is not drowned by loud computer audio; a track
 /// that is only noise is left as it is rather than boosted.
 fn mix(mic: &[f32], computer: &[f32]) -> Vec<f32> {
-    const TARGET: f32 = 0.1;
-    let gain = |track: &[f32]| {
-        let level = active_level(track);
-        if is_silent(track) || level < 0.003 {
-            1.0
-        } else {
-            (TARGET / level).clamp(0.25, 8.0)
-        }
-    };
+    let gain = |track: &[f32]| level_gain(&frame_levels(track), peak(track));
     let (mic_gain, computer_gain) = (gain(mic), gain(computer));
     (0..mic.len().max(computer.len()))
         .map(|i| {
@@ -368,27 +391,30 @@ impl Speakers {
 }
 
 /// A stretch with sound in it, in samples of the mix.
-#[derive(Debug, Clone, Copy)]
-struct Region {
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Region {
     /// Where the region starts, including some padding before the sound.
-    start: usize,
+    pub start: usize,
     /// Where the sound itself starts.
-    onset: usize,
-    end: usize,
+    pub onset: usize,
+    pub end: usize,
 }
 
-const FRAME: usize = WHISPER_RATE * 30 / 1000;
+pub(crate) const FRAME: usize = WHISPER_RATE * 30 / 1000;
 
 /// Frames of `track` with sound in them: above four times its own noise
 /// floor. The other side, imports and the echo check keep this fixed bar;
 /// only your mic gets `adaptive_frames` (#27).
 fn active_frames(track: &[f32], frames: usize) -> Vec<bool> {
-    let energies: Vec<f32> = track.chunks(FRAME).map(rms).collect();
+    active_frames_of(&frame_levels(track), frames)
+}
+
+fn active_frames_of(energies: &[f32], frames: usize) -> Vec<bool> {
     let mut active = vec![false; frames];
     if energies.is_empty() {
         return active;
     }
-    let mut sorted = energies.clone();
+    let mut sorted = energies.to_vec();
     sorted.sort_by(f32::total_cmp);
     let floor = sorted[sorted.len() / 10];
     let threshold = (floor * 4.0).max(0.002);
@@ -405,13 +431,17 @@ fn active_frames(track: &[f32], frames: usize) -> Vec<bool> {
 /// times). A clean track keeps the 12 dB; on a noisy mic, where speech stands
 /// only 10 to 15 dB over the floor, a fixed 12 dB dropped most of the speech
 /// (#27; the bench's `noisy-mic`).
+#[cfg(test)]
 fn adaptive_frames(track: &[f32], frames: usize) -> Vec<bool> {
-    let energies: Vec<f32> = track.chunks(FRAME).map(rms).collect();
+    adaptive_frames_of(&frame_levels(track), frames)
+}
+
+fn adaptive_frames_of(energies: &[f32], frames: usize) -> Vec<bool> {
     let mut active = vec![false; frames];
     if energies.is_empty() {
         return active;
     }
-    let mut sorted = energies.clone();
+    let mut sorted = energies.to_vec();
     sorted.sort_by(f32::total_cmp);
     let floor = sorted[sorted.len() / 10];
     let speech = sorted[(sorted.len() * 95 / 100).min(sorted.len() - 1)];
@@ -429,12 +459,19 @@ fn adaptive_frames(track: &[f32], frames: usize) -> Vec<bool> {
 /// Finds the parts with sound in them, by frame energy against the noise floor.
 /// Generous padding keeps word edges intact.
 fn speech_regions(tracks: &[&[f32]], len: usize) -> Vec<Region> {
+    let levels: Vec<Vec<f32>> = tracks.iter().map(|t| frame_levels(t)).collect();
+    let levels: Vec<&[f32]> = levels.iter().map(Vec::as_slice).collect();
+    speech_regions_of(&levels, len)
+}
+
+/// `speech_regions` from the frame levels of the tracks.
+pub(crate) fn speech_regions_of(levels: &[&[f32]], len: usize) -> Vec<Region> {
     let frames = len.div_ceil(FRAME);
     // Each track gets its own threshold: steady sound on one side (music, a
     // fan, a noisy line) must not hide the speech on the other side.
     let mut active = vec![false; frames];
-    for track in tracks {
-        for (a, on) in active.iter_mut().zip(active_frames(track, frames)) {
+    for energies in levels {
+        for (a, on) in active.iter_mut().zip(active_frames_of(energies, frames)) {
             *a |= on;
         }
     }
@@ -448,16 +485,22 @@ fn speech_regions(tracks: &[&[f32]], len: usize) -> Vec<Region> {
 /// and only in runs of a few frames, so the gaps between their words do not
 /// let the echo through either.
 fn own_speech_regions(mic: &[f32], computer: &[f32]) -> Vec<Region> {
+    own_speech_regions_of(&frame_levels(mic), &frame_levels(computer), mic.len())
+}
+
+/// `own_speech_regions` from the frame levels of the mic and the computer
+/// audio, for a mic of `len` samples.
+pub(crate) fn own_speech_regions_of(mic: &[f32], computer: &[f32], len: usize) -> Vec<Region> {
     const AROUND: usize = 3;
     const RUN: usize = 3;
-    let frames = mic.len().div_ceil(FRAME);
-    let level = |t: &[f32]| -> Vec<f32> {
+    let frames = len.div_ceil(FRAME);
+    let level = |levels: &[f32]| -> Vec<f32> {
         (0..frames)
-            .map(|i| rms(&t[(i * FRAME).min(t.len())..((i + 1) * FRAME).min(t.len())]))
+            .map(|i| levels.get(i).copied().unwrap_or(0.0))
             .collect()
     };
     let (own, other) = (level(mic), level(computer));
-    let mut active = adaptive_frames(mic, frames);
+    let mut active = adaptive_frames_of(mic, frames);
     for (i, a) in active.iter_mut().enumerate() {
         let loudest = other[i.saturating_sub(AROUND)..(i + AROUND + 1).min(frames)]
             .iter()
@@ -481,7 +524,7 @@ fn own_speech_regions(mic: &[f32], computer: &[f32]) -> Vec<Region> {
             active[start..i].iter_mut().for_each(|a| *a = false);
         }
     }
-    regions_from(&active, mic.len())
+    regions_from(&active, len)
 }
 
 fn regions_from(active: &[bool], len: usize) -> Vec<Region> {
@@ -504,14 +547,19 @@ fn regions_from(active: &[bool], len: usize) -> Vec<Region> {
 /// starts in the glued buffer. Whisper invents text in long silences and
 /// places timestamps badly after them, so it only gets the parts with sound;
 /// the map puts every timestamp back on the real timeline.
-struct Glued {
-    samples: Vec<f32>,
+pub(crate) struct Glued {
+    pub samples: Vec<f32>,
     /// (offset in `samples`, region)
     map: Vec<(usize, Region)>,
 }
 
 impl Glued {
     fn new(mix: &[f32], regions: &[Region]) -> Self {
+        Glued::glue(regions, |region| mix[region.start..region.end].to_vec())
+    }
+
+    /// The regions glued together, each one's sound given by `sound`.
+    pub(crate) fn glue(regions: &[Region], sound: impl Fn(&Region) -> Vec<f32>) -> Self {
         // Long enough for whisper to start a new segment at every join.
         const GAP: usize = WHISPER_RATE * 700 / 1000;
         let mut samples = Vec::new();
@@ -521,14 +569,30 @@ impl Glued {
                 samples.extend(std::iter::repeat_n(0.0, GAP));
             }
             map.push((samples.len(), *region));
-            samples.extend_from_slice(&mix[region.start..region.end]);
+            samples.extend(sound(region));
         }
         Glued { samples, map }
     }
 
     /// A time in the glued buffer as (ms on the real timeline, region index).
-    fn locate(&self, glued_ms: i64) -> (i64, usize) {
+    pub(crate) fn locate(&self, glued_ms: i64) -> (i64, usize) {
         locate(&self.map, glued_ms)
+    }
+
+    /// The other way round: a time on the real timeline as a time in the glued
+    /// buffer, held to the region it falls in (or the one before it).
+    fn place(&self, real_ms: i64) -> i64 {
+        let at = ms_to_sample(real_ms);
+        let index = self
+            .map
+            .iter()
+            .rposition(|(_, region)| region.start <= at)
+            .unwrap_or(0);
+        let Some((offset, region)) = self.map.get(index).copied() else {
+            return real_ms;
+        };
+        let within = at.clamp(region.start, region.end) - region.start;
+        sample_to_ms(offset + within)
     }
 }
 
@@ -634,10 +698,13 @@ fn hex(bytes: &[u8]) -> String {
 // Transcription
 
 /// Transcribes the meeting. `language` is a whisper code or "auto".
+/// `prior` is what was transcribed live during the recording: the regions it
+/// covers are not sent through whisper again.
 pub fn transcribe(
     mic: &[f32],
     computer: &[f32],
     language: &str,
+    prior: Option<&crate::live::Prior>,
     events: &Events,
     abort: &Abort,
 ) -> Result<Transcript, String> {
@@ -679,36 +746,50 @@ pub fn transcribe(
         &active_frames(&computer, computer.len().div_ceil(FRAME)),
     );
     let remote = voices(&computer, events, abort)?;
-    let context = load_whisper(events, abort)?;
+    let mut engine = engine(events, abort)?;
 
     let length = |regions: &[Region]| regions.iter().map(|r| r.end - r.start).sum::<usize>();
     let total = (length(&mic_regions) + length(&computer_regions)).max(1) as f64;
     let mut sides = [
-        (&mic, &mic_regions, Speakers::Side("You", local), echo),
+        (
+            &mic,
+            &mic_regions,
+            Speakers::Side("You", local),
+            echo,
+            prior.map(|p| &p.mic),
+        ),
         (
             &computer,
             &computer_regions,
             Speakers::Side("Remote", remote),
             Vec::new(),
+            prior.map(|p| &p.computer),
         ),
     ];
     // The side with the most sound first: with "auto" its language counts for both.
-    sides.sort_by_key(|(_, regions, _, _)| std::cmp::Reverse(length(regions)));
+    sides.sort_by_key(|(_, regions, _, _, _)| std::cmp::Reverse(length(regions)));
     let mut language = language.to_owned();
     let mut detected = None;
+    if language == "auto"
+        && let Some(found) = prior.and_then(|p| p.language.clone())
+    {
+        language = found.clone();
+        detected = Some(found);
+    }
     let mut segments = Vec::new();
     let mut done = 0.0;
-    for (track, regions, speakers, echo) in &sides {
+    for (track, regions, speakers, echo, prior) in &sides {
         if regions.is_empty() {
             continue;
         }
         let share = length(regions) as f64 / total;
         let (lines, found) = side_pass(
-            &context,
+            &mut engine,
             track,
             regions,
             speakers,
             &language,
+            *prior,
             (done, done + share),
             false,
             events,
@@ -999,13 +1080,14 @@ fn whisper_pass(
     events: &Events,
     abort: &Abort,
 ) -> Result<Transcript, String> {
-    let context = load_whisper(events, abort)?;
+    let mut engine = engine(events, abort)?;
     let (segments, detected) = side_pass(
-        &context,
+        &mut engine,
         mixed,
         regions,
         speakers,
         language,
+        None,
         (0.0, 1.0),
         true,
         events,
@@ -1031,57 +1113,255 @@ fn load_whisper(events: &Events, abort: &Abort) -> Result<WhisperContext, String
     emit(events, Event::Stage("Loading model".into()));
     emit(events, Event::Progress(0.0));
     whisper_rs::install_logging_hooks();
-    let mut context_params = WhisperContextParameters::default();
-    context_params.use_gpu(cfg!(feature = "vulkan"));
-    // Word times aligned on the attention heads (DTW): the plain token times
-    // drift by up to a second, too much to tell where one speaker takes over.
     // A model file of unknown kind gets plain token times.
-    if let Some(model_preset) = crate::models::dtw_preset() {
-        context_params.dtw_parameters(DtwParameters {
-            mode: DtwMode::ModelPreset { model_preset },
-            ..Default::default()
-        });
+    whisper_words::load(
+        &model,
+        crate::models::dtw_preset(),
+        cfg!(feature = "vulkan"),
+    )
+}
+
+/// Where the whisper passes run: a remote worker when one is set and
+/// answers, else here.
+pub(crate) enum Engine {
+    Local(WhisperContext),
+    Remote(Remote),
+}
+
+fn engine(events: &Events, abort: &Abort) -> Result<Engine, String> {
+    match Remote::connect() {
+        Ok(Some(remote)) => return Ok(Engine::Remote(remote)),
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("{APP_NAME}: the worker is away, transcribing here: {e}");
+            emit(events, Event::Stage("Worker away, transcribing here".into()));
+        }
     }
-    WhisperContext::new_with_params(&model, context_params)
-        .map_err(|e| format!("could not load the model {}: {e}", model.display()))
+    Ok(Engine::Local(load_whisper(events, abort)?))
 }
 
 /// Whisper over the stretches of `track` with sound in them, then the lines.
+/// Regions that `prior` already transcribed (live, during the recording) keep
+/// those words; only the rest goes through whisper now.
 /// Progress runs from `progress.0` to `progress.1`.
 #[allow(clippy::too_many_arguments)]
 fn side_pass(
-    context: &WhisperContext,
+    engine: &mut Engine,
     track: &[f32],
     regions: &[Region],
     speakers: &Speakers,
     language: &str,
+    prior: Option<&crate::live::SidePrior>,
     progress: (f64, f64),
     paragraphs: bool,
     events: &Events,
     abort: &Abort,
 ) -> Result<(Vec<Segment>, Option<String>), String> {
     let glued = Glued::new(track, regions);
-    emit(events, Event::Stage("Transcribing".into()));
-    let (words, detected) =
-        run_whisper(context, &glued, speakers, language, progress, events, abort)?;
+    let (reused, todo) = match prior {
+        Some(prior) => reuse(regions, prior),
+        None => (Vec::new(), regions.to_vec()),
+    };
+    if reused.is_empty() {
+        emit(events, Event::Stage("Transcribing".into()));
+        let (words, detected) =
+            run_whisper(engine, &glued, speakers, language, progress, events, abort)?;
+        return Ok((
+            phrases(&words, &glued, speakers, track, paragraphs),
+            detected,
+        ));
+    }
+
+    // Words on the real timeline first, then placed in the glued buffer of
+    // all the regions, as one pass over everything would have left them.
+    let mut real = reused;
+    let mut detected = None;
+    if !todo.is_empty() {
+        emit(events, Event::Stage("Transcribing the last part".into()));
+        let rest = Glued::new(track, &todo);
+        let (words, found) =
+            run_whisper(engine, &rest, speakers, language, progress, events, abort)?;
+        detected = found;
+        let base = real.iter().map(|w| w.segment + 1).max().unwrap_or(0);
+        real.extend(words.into_iter().map(|w| Word {
+            start_ms: rest.locate(w.start_ms).0,
+            end_ms: rest.locate(w.end_ms).0,
+            segment: base + w.segment,
+            ..w
+        }));
+    }
+    real.sort_by_key(|w| w.start_ms);
+    let mut order: Vec<usize> = Vec::new();
+    let words: Vec<Word> = real
+        .into_iter()
+        .map(|w| {
+            let segment = order.iter().position(|s| *s == w.segment).unwrap_or_else(|| {
+                order.push(w.segment);
+                order.len() - 1
+            });
+            Word {
+                start_ms: glued.place(w.start_ms),
+                end_ms: glued.place(w.end_ms),
+                segment,
+                ..w
+            }
+        })
+        .collect();
+    emit(events, Event::Progress(progress.1));
     Ok((
         phrases(&words, &glued, speakers, track, paragraphs),
         detected,
     ))
 }
 
-/// A word with its times in the glued buffer, and how sure whisper was that
-/// its segment held speech at all.
-struct Word {
-    text: String,
-    start_ms: i64,
-    end_ms: i64,
-    no_speech: f32,
-    /// Index of the whisper segment it came from.
-    segment: usize,
+/// Splits `regions` into the ones `prior` covered, as their words on the real
+/// timeline, and the ones still to transcribe. A region counts as covered when
+/// the live passes held all of it, short pauses between two of their regions
+/// aside; its words are the live words that fall in it.
+fn reuse(regions: &[Region], prior: &crate::live::SidePrior) -> (Vec<Word>, Vec<Region>) {
+    // The padding around a region is room for error, not sound.
+    const SLACK: usize = WHISPER_RATE * 300 / 1000;
+    // Two live regions this close count as one: the gap between them is the
+    // quiet that split them, which the region after the meeting spans.
+    const PAUSE: usize = WHISPER_RATE;
+    let mut spans: Vec<(usize, usize)> = prior.covered.clone();
+    spans.sort_unstable();
+    let mut joined: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in spans {
+        match joined.last_mut() {
+            Some(last) if start <= last.1 + PAUSE => last.1 = last.1.max(end),
+            _ => joined.push((start, end)),
+        }
+    }
+    let covered = |r: &Region| {
+        joined
+            .iter()
+            .any(|(start, end)| *start <= r.start + SLACK && *end + SLACK >= r.end)
+    };
+    let is_covered: Vec<bool> = regions.iter().map(covered).collect();
+    let mut words = Vec::new();
+    for word in &prior.words {
+        let at = ms_to_sample(word.start_ms);
+        let home = regions
+            .iter()
+            .position(|r| r.start.saturating_sub(SLACK) <= at && at < r.end + SLACK);
+        if home.is_some_and(|i| is_covered[i]) {
+            words.push(word.clone());
+        }
+    }
+    let todo = regions
+        .iter()
+        .zip(&is_covered)
+        .filter(|(_, covered)| !**covered)
+        .map(|(r, _)| *r)
+        .collect();
+    (words, todo)
 }
 
 fn run_whisper(
+    engine: &mut Engine,
+    glued: &Glued,
+    speakers: &Speakers,
+    language: &str,
+    progress: (f64, f64),
+    events: &Events,
+    abort: &Abort,
+) -> Result<(Vec<Word>, Option<String>), String> {
+    if let Engine::Remote(remote) = engine {
+        match remote_whisper(remote, glued, speakers, language, progress, events, abort) {
+            Err(e) if e != CANCELLED => {
+                eprintln!("{APP_NAME}: the worker failed, transcribing here: {e}");
+                emit(events, Event::Stage("Worker failed, transcribing here".into()));
+                *engine = Engine::Local(load_whisper(events, abort)?);
+            }
+            result => return result,
+        }
+    }
+    let Engine::Local(context) = engine else {
+        unreachable!("a failed worker is replaced by the local model");
+    };
+    local_whisper(context, glued, speakers, language, progress, events, abort)
+}
+
+/// At most this much audio per request, cut where two regions join, so the
+/// worker reports progress and a cancel does not wait for a whole meeting.
+const REMOTE_PASS: usize = WHISPER_RATE * 600;
+
+fn remote_whisper(
+    remote: &Remote,
+    glued: &Glued,
+    speakers: &Speakers,
+    language: &str,
+    progress: (f64, f64),
+    events: &Events,
+    abort: &Abort,
+) -> Result<(Vec<Word>, Option<String>), String> {
+    emit(events, Event::Stage("Transcribing on the worker".into()));
+    let total = glued.samples.len().max(1);
+    let mut cuts: Vec<usize> = vec![0];
+    for (offset, _) in &glued.map {
+        if *offset - cuts.last().copied().unwrap_or(0) >= REMOTE_PASS {
+            cuts.push(*offset);
+        }
+    }
+    cuts.push(glued.samples.len());
+    let mut language = language.to_owned();
+    let mut detected = None;
+    let mut words: Vec<Word> = Vec::new();
+    for pair in cuts.windows(2) {
+        let (from, to) = (pair[0], pair[1]);
+        if from >= to {
+            continue;
+        }
+        if abort.load(Ordering::Relaxed) {
+            return Err(CANCELLED.into());
+        }
+        let (part, found) = remote.words(&glued.samples[from..to], &language)?;
+        if language == "auto"
+            && let Some(found) = found.clone()
+        {
+            language = found;
+        }
+        detected = detected.or(found);
+        let base = words.iter().map(|w| w.segment + 1).max().unwrap_or(0);
+        let shift = sample_to_ms(from);
+        let part: Vec<Word> = part
+            .into_iter()
+            .map(|w| Word {
+                start_ms: w.start_ms + shift,
+                end_ms: w.end_ms + shift,
+                segment: base + w.segment,
+                ..w
+            })
+            .collect();
+        // The lines for the animation, as the local pass shows them.
+        let mut i = 0;
+        while i < part.len() {
+            let segment = part[i].segment;
+            let line: Vec<&Word> = part[i..].iter().take_while(|w| w.segment == segment).collect();
+            i += line.len();
+            let text = line.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+            if text.is_empty() || is_noise_marker(&text) {
+                continue;
+            }
+            let (start, _) = glued.locate(line[0].start_ms);
+            let (end, _) = glued.locate(line[line.len() - 1].end_ms);
+            emit(
+                events,
+                Event::Segment(format!("{}: {text}", speakers.speaker(start, end))),
+            );
+        }
+        words.extend(part);
+        let done = to as f64 / total as f64;
+        emit(
+            events,
+            Event::Progress(progress.0 + (progress.1 - progress.0) * done),
+        );
+    }
+    Ok((words, detected))
+}
+
+fn local_whisper(
     context: &WhisperContext,
     glued: &Glued,
     speakers: &Speakers,
@@ -1091,20 +1371,7 @@ fn run_whisper(
     abort: &Abort,
 ) -> Result<(Vec<Word>, Option<String>), String> {
     let mut state = context.create_state().map_err(|e| e.to_string())?;
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
-    params.set_n_threads(threads.min(16) as i32);
-    params.set_language(Some(language));
-    params.set_print_special(false);
-    params.set_print_progress(false);
-    params.set_print_realtime(false);
-    params.set_print_timestamps(false);
-    params.set_suppress_blank(true);
-    params.set_suppress_nst(true);
-    params.set_no_speech_thold(0.6);
-    // Word times, so a segment can be split where the speaker changes.
-    params.set_token_timestamps(true);
-    params.set_split_on_word(true);
+    let mut params = whisper_words::params(language);
 
     let progress_events = events.clone();
     params.set_progress_callback_safe(move |pct: i32| {
@@ -1145,59 +1412,7 @@ fn run_whisper(
         return Err(CANCELLED.into());
     }
     result.map_err(|e| e.to_string())?;
-
-    let detected = whisper_rs::get_lang_str(state.full_lang_id_from_state()).map(str::to_owned);
-    let eot = context.token_eot();
-    let mut words: Vec<Word> = Vec::new();
-    for (index, segment) in state.as_iter().enumerate() {
-        let no_speech = segment.no_speech_probability();
-        // Bytes first: a character can be split over two tokens.
-        let mut current: Option<(Vec<u8>, i64, i64)> = None;
-        let flush = |current: &mut Option<(Vec<u8>, i64, i64)>, words: &mut Vec<Word>| {
-            if let Some((bytes, start_ms, end_ms)) = current.take() {
-                let text = String::from_utf8_lossy(&bytes).trim().to_owned();
-                if !text.is_empty() {
-                    words.push(Word {
-                        text,
-                        start_ms,
-                        end_ms,
-                        no_speech,
-                        segment: index,
-                    });
-                }
-            }
-        };
-        for i in 0..segment.n_tokens() {
-            let Some(token) = segment.get_token(i) else {
-                continue;
-            };
-            if token.token_id() >= eot {
-                continue; // timestamps and other special tokens
-            }
-            let Ok(bytes) = token.to_bytes() else {
-                continue;
-            };
-            let data = token.token_data();
-            // DTW gives one moment per token; fall back to the plain times.
-            let (t0, t1) = if data.t_dtw >= 0 {
-                (data.t_dtw * 10, data.t_dtw * 10)
-            } else {
-                (data.t0 * 10, data.t1 * 10)
-            };
-            match current.as_mut() {
-                Some((word, _, end)) if !bytes.starts_with(b" ") => {
-                    word.extend_from_slice(bytes);
-                    *end = t1.max(*end);
-                }
-                _ => {
-                    flush(&mut current, &mut words);
-                    current = Some((bytes.to_vec(), t0, t1));
-                }
-            }
-        }
-        flush(&mut current, &mut words);
-    }
-    Ok((words, detected))
+    Ok(whisper_words::words(context, &state))
 }
 
 /// A pause longer than this starts a new paragraph, even for the same speaker.
@@ -1491,7 +1706,7 @@ pub fn cli(args: &[String]) -> glib::ExitCode {
     run_cli(|events, abort| {
         let mic = load_track(mic_path)?;
         let computer = load_track(computer_path)?;
-        transcribe(&mic, &computer, &language, events, abort)
+        transcribe(&mic, &computer, &language, None, events, abort)
     })
 }
 
@@ -1529,7 +1744,9 @@ pub fn cli_file(args: &[String]) -> glib::ExitCode {
 
 /// Runs a transcription for the command line: progress and live lines on
 /// stderr, the Markdown on stdout.
-fn run_cli(work: impl FnOnce(&Events, &Abort) -> Result<Transcript, String>) -> glib::ExitCode {
+pub(crate) fn run_cli(
+    work: impl FnOnce(&Events, &Abort) -> Result<Transcript, String>,
+) -> glib::ExitCode {
     let (tx, rx) = async_channel::unbounded();
     let started = Instant::now();
     let reporter = std::thread::spawn(move || {

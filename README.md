@@ -191,6 +191,29 @@ languages = ["th", "ja", "Korean"]
 
 They are added after the built-in ones, named the way whisper names them (Thai, Japanese, Korean), and picked up the next time the app starts. A name whisper does not know is skipped. The `.en` models only transcribe English, so use a multilingual model, like the default `large-v3-turbo`, for other languages.
 
+### Transcribing on another machine, live
+
+whisper is heavy work for a laptop's GPU, and on a machine with integrated graphics it slows the whole desktop down, the mouse pointer included, while it runs. Another machine you own can do it instead: a Mac with Apple Silicon (Metal), or a box with an NVIDIA (CUDA) or other Vulkan GPU. Run the worker there and point the recorder at it in `~/.config/omarchy-meeting-recorder/config.toml`, above any `[[action]]`:
+
+```toml
+remote = "http://my-mac.tailnet.ts.net:8178"
+```
+
+With a worker set, the meeting is transcribed **while you record**. Every fifteen seconds the recorder looks at what was said since the last look, and speech that has finished (two seconds of quiet after it) goes to the worker, in passes of twenty seconds or more, or sooner when some has waited 45 seconds. When you stop, only the last stretch is left, so the transcript is there shortly after the call ends instead of minutes later.
+
+The live passes find the speech the same way as after the meeting, but over the audio so far, and later audio can still move the edges a little. So they are a head start, not the answer: after the meeting every stretch of speech is found again over the whole recording, a stretch the live passes held keeps their words, and any other goes through whisper then. Telling the voices apart, the echo check and the lines all still happen on your machine, the same as without a worker.
+
+The worker only does whisper: it gets the audio of each pass (16 kHz mono) and sends back the words with their times. It keeps nothing. When it cannot be reached, the recorder says so, carries on recording, and transcribes here at the end. Here, the transcription runs at the lowest CPU priority, so the desktop stays quick either way.
+
+`whisper-worker/` holds the worker. On a Mac:
+
+```bash
+cp ggml-large-v3-turbo.bin ~/.local/share/omarchy-meeting-recorder/models/   # the same model as the recorder
+whisper-worker/macos/install.sh 100.64.0.1:8178                              # the address to listen on
+```
+
+It listens on that address only, without a password, so give it one that only your own machines reach, such as its Tailscale IP. `OMARCHY_MEETING_REMOTE` overrides the setting for one run (empty turns it off), and `omarchy-meeting-recorder transcribe-live <mic> <computer>` plays a recorded meeting through the live passes as if it were happening, then prints how long the end took.
+
 ## Actions
 
 Your own scripts, picked from the **Actions** menu on the done page: store the transcript in Obsidian, publish it, mail it around. Each is a name and a command in `~/.config/omarchy-meeting-recorder/config.toml`; the command gets the meeting folder and the meeting's details, and what it prints last shows up in the app, with an **Open** button for a link. Give one `auto = true` and it runs by itself every time a transcript is done, after the chapters when there are any: a meeting is filed in your notes, or handed to a pipeline of your own, without a click.
@@ -205,7 +228,7 @@ Your own scripts, picked from the **Actions** menu on the done page: store the t
 
 ## Privacy
 
-The audio, the transcript and everything else stay on your computer. The only thing that leaves it is the transcript text for the chapters, and only when you have set a default agent: it goes to that agent's service, the one you already chose and pay for. No agent, no chapters, nothing sent. Actions are yours: they send whatever your scripts send, and only when you pick one.
+The audio, the transcript and everything else stay on your computer. The only thing that leaves it is the transcript text for the chapters, and only when you have set a default agent: it goes to that agent's service, the one you already chose and pay for. No agent, no chapters, nothing sent. With a [worker](#transcribing-on-another-machine-live) set, the audio of each whisper pass goes to that machine and its words come back. Actions are yours: they send whatever your scripts send, and only when you pick one.
 
 ## Requirements
 
@@ -290,6 +313,7 @@ This also recovers a failed first-start “Add to Bar” attempt in version 1.0.
 | `omarchy-meeting-recorder wait [--audio]` | Wait until the meeting being recorded is done and print its folder, for a script or an agent; with `--audio` as soon as the audio is saved, before the transcript |
 | `omarchy-meeting-recorder transcribe <mic> <computer> [--language xx] [--model name]` | Transcribe two tracks and print the transcript as Markdown |
 | `omarchy-meeting-recorder transcribe-file <audio> [--speakers N] [--language xx] [--model name]` | Transcribe one file, telling the voices apart, and print the transcript as Markdown |
+| `omarchy-meeting-recorder transcribe-live <mic> <computer> [--language xx]` | Play two recorded tracks through the [live passes](#transcribing-on-another-machine-live) on the worker as if they were being recorded, then transcribe what is left as at the end of a meeting, with timings |
 | `omarchy-meeting-recorder ask "<prompt>" < text` | Run a prompt over stdin through the default agent, without tools (`ask --agent` shows which agent that is) |
 | `omarchy-meeting-recorder action "<name>" <meeting folder>` | Run one of your [actions](docs/actions.md) on a meeting, as the done page does; without arguments it lists them |
 
