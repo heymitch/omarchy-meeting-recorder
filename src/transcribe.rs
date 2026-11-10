@@ -738,14 +738,25 @@ pub fn transcribe(
     // several people on the other end of the call. On the mic only your own
     // stretches count, so the other side leaking in is not taken for a person
     // in the room.
-    let (local, heard) = voices_heard(&only(&mic, &mic_regions), events, abort)?;
+    // Both sides at once: the speaker model uses up to eight threads each.
+    // The other side's progress stays quiet, so the bar follows one of them.
+    let own = only(&mic, &mic_regions);
+    let (mine, theirs) = std::thread::scope(|scope| {
+        let theirs = scope.spawn(|| {
+            let (quiet, _) = async_channel::unbounded();
+            voices(&computer, &quiet, abort)
+        });
+        let mine = voices_heard(&own, events, abort);
+        (mine, theirs.join().unwrap_or_else(|_| Err("the speaker model crashed".into())))
+    });
+    let (local, heard) = mine?;
+    let remote = theirs?;
     // Echo that got past the level check can still come out as a voice of
     // its own; its lines are dropped after the mic's pass.
     let (local, echo) = split_echo(
         local,
         &active_frames(&computer, computer.len().div_ceil(FRAME)),
     );
-    let remote = voices(&computer, events, abort)?;
     let mut engine = engine(events, abort)?;
 
     let length = |regions: &[Region]| regions.iter().map(|r| r.end - r.start).sum::<usize>();
@@ -1214,17 +1225,54 @@ fn side_pass(
     ))
 }
 
-/// Splits `regions` into the ones `prior` covered, as their words on the real
-/// timeline, and the ones still to transcribe. A region counts as covered when
-/// the live passes held all of it, short pauses between two of their regions
-/// aside; its words are the live words that fall in it.
-fn reuse(regions: &[Region], prior: &crate::live::SidePrior) -> (Vec<Word>, Vec<Region>) {
-    // The padding around a region is room for error, not sound.
-    const SLACK: usize = WHISPER_RATE * 300 / 1000;
-    // Two live regions this close count as one: the gap between them is the
-    // quiet that split them, which the region after the meeting spans.
+/// How much of each side `prior` covers, against the regions found over
+/// the whole recording: for `transcribe-live`.
+pub(crate) fn coverage(mic: &[f32], computer: &[f32], prior: &crate::live::Prior) -> String {
+    let (mic, computer) = (mix(mic, &[]), mix(computer, &[]));
+    let sides = [
+        ("mic", own_speech_regions(&mic, &computer), &prior.mic),
+        ("computer", speech_regions(&[&computer], computer.len()), &prior.computer),
+    ];
+    let secs = |regions: &[Region]| {
+        regions.iter().map(|r| r.end - r.start).sum::<usize>() as f64 / WHISPER_RATE as f64
+    };
+    sides
+        .iter()
+        .map(|(name, regions, prior)| {
+            let (_, todo) = reuse(regions, prior);
+            // How much of what is left the live passes did hear, in part.
+            let heard: usize = todo
+                .iter()
+                .map(|r| {
+                    prior
+                        .covered
+                        .iter()
+                        .map(|(a, b)| r.end.min(*b).saturating_sub(r.start.max(*a)))
+                        .sum::<usize>()
+                })
+                .sum();
+            let untouched = todo
+                .iter()
+                .filter(|r| !prior.covered.iter().any(|(a, b)| *a < r.end && *b > r.start))
+                .count();
+            format!(
+                "{name}: {} regions ({:.0}s), {} left to do ({:.0}s, {:.0}s of it heard live, {untouched} not heard at all)",
+                regions.len(),
+                secs(regions),
+                todo.len(),
+                secs(&todo),
+                heard as f64 / WHISPER_RATE as f64,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Live spans with the short pauses between them closed: the quiet that
+/// split two live regions is spanned by a region found later.
+pub(crate) fn joined_spans(spans: &[(usize, usize)]) -> Vec<(usize, usize)> {
     const PAUSE: usize = WHISPER_RATE;
-    let mut spans: Vec<(usize, usize)> = prior.covered.clone();
+    let mut spans = spans.to_vec();
     spans.sort_unstable();
     let mut joined: Vec<(usize, usize)> = Vec::new();
     for (start, end) in spans {
@@ -1233,12 +1281,27 @@ fn reuse(regions: &[Region], prior: &crate::live::SidePrior) -> (Vec<Word>, Vec<
             _ => joined.push((start, end)),
         }
     }
-    let covered = |r: &Region| {
-        joined
-            .iter()
-            .any(|(start, end)| *start <= r.start + SLACK && *end + SLACK >= r.end)
-    };
-    let is_covered: Vec<bool> = regions.iter().map(covered).collect();
+    joined
+}
+
+/// Whether one of the `joined` spans holds all of `region`; its padding is
+/// room for error, not sound.
+pub(crate) fn covered_by(joined: &[(usize, usize)], region: &Region) -> bool {
+    const SLACK: usize = WHISPER_RATE * 300 / 1000;
+    joined
+        .iter()
+        .any(|(start, end)| *start <= region.start + SLACK && *end + SLACK >= region.end)
+}
+
+/// Splits `regions` into the ones `prior` covered, as their words on the real
+/// timeline, and the ones still to transcribe. A region counts as covered when
+/// the live passes held all of it, short pauses between two of their regions
+/// aside; its words are the live words that fall in it.
+fn reuse(regions: &[Region], prior: &crate::live::SidePrior) -> (Vec<Word>, Vec<Region>) {
+    // The padding around a region is room for error, not sound.
+    const SLACK: usize = WHISPER_RATE * 300 / 1000;
+    let joined = joined_spans(&prior.covered);
+    let is_covered: Vec<bool> = regions.iter().map(|r| covered_by(&joined, r)).collect();
     let mut words = Vec::new();
     for word in &prior.words {
         let at = ms_to_sample(word.start_ms);
